@@ -1,0 +1,263 @@
+function [trip_report, reward_status] = EcoDrive_Advanced_Backend(...
+    start_coords, end_coords, vehicle_class, vehicle_type, vehicle_load_kg, ac_usage, ...
+    vehicle_cc, vehicle_age, tire_pressure, road_type)
+%ECO_DRIVE_ADVANCED_BACKEND
+% Returns trip metrics, route directions, reward status, and driving data,
+% including route geometry (lat/lon arrays) and additional metrics.
+
+try
+    [distance_km, duration_s, avg_speed_kmh, directions, routeLat, routeLon] = ...
+        get_OSRM_Route(start_coords, end_coords);
+catch
+    distance_km = haversine_distance(start_coords(1), start_coords(2), ...
+                                     end_coords(1), end_coords(2));
+    duration_s = (distance_km / 60) * 3600;
+    avg_speed_kmh = 60;
+    directions = {'Direct route computed using Haversine formula.'};
+    routeLat = [start_coords(1), end_coords(1)];
+    routeLon = [start_coords(2), end_coords(2)];
+end
+
+elevation_gain_m = get_elevation_gain(start_coords, end_coords);
+[speed_kmh, acceleration_mps2, time_s, idling_time] = simulate_driving_behavior(duration_s, avg_speed_kmh, road_type);
+[harsh_accel, harsh_brake] = analyze_acceleration(acceleration_mps2);
+[energy_used, co2_emissions] = calculate_emissions_advanced(...
+    distance_km, elevation_gain_m, vehicle_class, vehicle_type, vehicle_load_kg, ...
+    ac_usage, harsh_accel, harsh_brake, idling_time, vehicle_cc, vehicle_age, tire_pressure, road_type);
+driving_score = calculate_driving_score(harsh_accel, harsh_brake, idling_time, duration_s);
+
+% New reward formula using both distance and CO2 emissions.
+reward_points = max(0, round(0.3 * distance_km - 0.2 * co2_emissions));
+eco_tips = determine_rewards(co2_emissions);
+
+trip_report = struct(...
+    'Distance_km',         distance_km, ...
+    'AvgSpeed_kmh',        avg_speed_kmh, ...
+    'Elevation_Gain_m',    elevation_gain_m, ...
+    'Vehicle_Class',       vehicle_class, ...
+    'Vehicle_Type',        vehicle_type, ...
+    'Vehicle_CC',          vehicle_cc, ...
+    'Vehicle_Age',         vehicle_age, ...
+    'Tire_Pressure_PSI',   tire_pressure, ...
+    'Road_Type',           road_type, ...
+    'Energy_Used',         energy_used, ...
+    'CO2_Emissions_kg',    co2_emissions, ...
+    'Driving_Score',       driving_score, ...
+    'Harsh_Acceleration',  harsh_accel, ...
+    'Harsh_Braking',       harsh_brake, ...
+    'Idling_Time_sec',     idling_time, ...
+    'Directions',          directions, ...
+    'RouteLat',            routeLat, ...
+    'RouteLon',            routeLon, ...
+    'SimulatedSpeed',      speed_kmh, ...
+    'DrivingData', struct('time', time_s, 'speed', speed_kmh, ...
+                          'acceleration', acceleration_mps2, 'co2_emissions', co2_emissions) ...
+    );
+reward_status = struct('Reward_Points', reward_points, 'Eco_Tips', {eco_tips});
+end
+
+%% -------------------------------
+%% Helper Functions
+%% -------------------------------
+
+function [distance_km, duration_s, avg_speed_kmh, directions, routeLat, routeLon] = get_OSRM_Route(start_coords, end_coords)
+base_url = 'http://router.project-osrm.org/route/v1/driving/';
+coords_str = sprintf('%.6f,%.6f;%.6f,%.6f',...
+    start_coords(2), start_coords(1), end_coords(2), end_coords(1));
+url = [base_url, coords_str, '?overview=full&geometries=geojson&steps=true'];
+opts = weboptions('Timeout', 30);
+data = webread(url, opts);
+if iscell(data.routes)
+    route = data.routes{1};
+else
+    route = data.routes(1);
+end
+distance_km = route.distance / 1000;
+duration_s = route.duration;
+avg_speed_kmh = distance_km / (duration_s / 3600);
+directions = {};
+if isfield(route, 'legs') && ~isempty(route.legs)
+    legs = route.legs;
+    if ~iscell(legs)
+        legs = num2cell(legs);
+    end
+    for i = 1:numel(legs)
+        curLeg = legs{i};
+        if isfield(curLeg, 'steps') && ~isempty(curLeg.steps)
+            steps = curLeg.steps;
+            if ~iscell(steps)
+                steps = num2cell(steps);
+            end
+            for j = 1:numel(steps)
+                step = steps{j};
+                if isfield(step, 'maneuver') && isfield(step.maneuver, 'instruction')
+                    directions{end+1} = step.maneuver.instruction; %#ok<AGROW>
+                end
+            end
+        end
+    end
+end
+if isempty(directions)
+    directions = {'No detailed directions available.'};
+end
+coords = route.geometry.coordinates; 
+routeLon = coords(:,1);
+routeLat = coords(:,2);
+end
+
+function elevation_gain = get_elevation_gain(start_coords, end_coords)
+try
+    url_s = sprintf('https://api.open-elevation.com/api/v1/lookup?locations=%.4f,%.4f',...
+        start_coords(1), start_coords(2));
+    data_s = webread(url_s);
+    if iscell(data_s.results)
+        elev_start = data_s.results{1}.elevation;
+    else
+        elev_start = data_s.results(1).elevation;
+    end
+    url_e = sprintf('https://api.open-elevation.com/api/v1/lookup?locations=%.4f,%.4f',...
+        end_coords(1), end_coords(2));
+    data_e = webread(url_e);
+    if iscell(data_e.results)
+        elev_end = data_e.results{1}.elevation;
+    else
+        elev_end = data_e.results(1).elevation;
+    end
+    elevation_gain = max(0, elev_end - elev_start);
+catch
+    elevation_gain = 0;
+end
+end
+
+function [speed_kmh, acceleration, time, idling_time] = simulate_driving_behavior(duration_s, avg_speed_kmh, road_type)
+time = 0:1:round(duration_s);
+speed_kmh = zeros(size(time));
+acceleration = zeros(size(time));
+speed_kmh(1) = avg_speed_kmh;
+switch lower(road_type)
+    case 'city'
+        traffic_prob = 0.2;
+    case 'highway'
+        traffic_prob = 0.05;
+    otherwise
+        traffic_prob = 0.1;
+end
+for i = 2:length(time)
+    if rand() < traffic_prob
+        speed_kmh(i) = 0;
+        acceleration(i) = 0;
+    else
+        a = (rand() - 0.5) * 1.5;
+        delta = a * 3.6;
+        speed_kmh(i) = speed_kmh(i-1) + delta;
+        speed_kmh(i) = max(min(speed_kmh(i), 120), 0);
+        acceleration(i) = a;
+    end
+end
+idling_time = sum(speed_kmh == 0);
+end
+
+function [energy_used, co2_emissions] = calculate_emissions_advanced(...
+    distance_km, elevation_gain_m, vehicle_class, vehicle_type, load_kg, ac_usage, ...
+    harsh_accel, harsh_brake, idling_time, vehicle_cc, vehicle_age, tire_pressure, road_type)
+switch lower(vehicle_type)
+    case 'gasoline'
+        base_consumption = 8;
+        co2_per_unit = 2.31;
+    case 'diesel'
+        base_consumption = 7;
+        co2_per_unit = 2.68;
+    case 'electric'
+        base_consumption = 15;
+        co2_per_unit = 0.50;
+    otherwise
+        base_consumption = 9;
+        co2_per_unit = 2.31;
+end
+switch lower(vehicle_class)
+    case 'bike'
+        class_factor = 0.4;
+    case 'car'
+        class_factor = 1.0;
+    case 'bus'
+        class_factor = 2.0;
+    otherwise
+        class_factor = 1.0;
+end
+engine_penalty = max(0, (vehicle_cc - 1000) / 500) * 0.01;
+age_penalty = (vehicle_age / 5) * 0.01;
+rec_press = 35;
+tire_penalty = max(0, ((rec_press - tire_pressure) / 5) * 0.01);
+switch lower(road_type)
+    case 'city'
+        road_penalty = 0.10;
+    case 'highway'
+        road_penalty = -0.05;
+    otherwise
+        road_penalty = 0;
+end
+energy_used = (distance_km / 100) * base_consumption;
+energy_used = energy_used * (1 + engine_penalty + age_penalty + tire_penalty + road_penalty);
+energy_used = energy_used + (elevation_gain_m * 0.0001);
+idle_penalty = idling_time * 0.0005;
+energy_used = energy_used + idle_penalty;
+co2_emissions = energy_used * co2_per_unit;
+co2_emissions = co2_emissions * (1 + 0.05*(harsh_accel + harsh_brake));
+load_factor = 1 + (load_kg / 50) * 0.01;
+energy_used = energy_used * load_factor;
+co2_emissions = co2_emissions * load_factor;
+if ac_usage
+    energy_used = energy_used * 1.10;
+    co2_emissions = co2_emissions * 1.10;
+end
+energy_used = energy_used * class_factor;
+co2_emissions = co2_emissions * class_factor;
+end
+
+function [harsh_accel, harsh_brake] = analyze_acceleration(acceleration)
+harsh_accel = sum(acceleration > 3);
+harsh_brake = sum(acceleration < -3);
+end
+
+function driving_score = calculate_driving_score(harsh_accel, harsh_brake, idling_time, duration_s)
+base_score = 100;
+penalty = (harsh_accel + harsh_brake)*5 + (idling_time/(duration_s+eps))*30;
+driving_score = max(0, round(base_score - penalty));
+end
+
+function eco_tips = determine_rewards(co2_emissions)
+if co2_emissions < 3
+    eco_tips = {
+        'Fantastic job! Your emissions are impressively low.'
+        'Keep using efficient driving techniques and regular maintenance.'
+        'Consider alternative transport for short trips.'
+    };
+elseif co2_emissions < 10
+    eco_tips = {
+        'Good eco-driving! Smooth acceleration can further lower emissions.'
+        'Maintain proper tire pressure and vehicle check-ups.'
+    };
+elseif co2_emissions < 20
+    eco_tips = {
+        'Moderate emissions detected. Avoid harsh braking and accelerate gently.'
+        'Plan routes to minimize idling.'
+    };
+else
+    eco_tips = {
+        'High emissions detected. Consider servicing your vehicle and reducing load.'
+        'Adopt eco-driving techniques: gentle starts/stops, moderate speed.'
+        'Explore alternative transport for short trips.'
+    };
+end
+end
+
+function d = haversine_distance(lat1, lon1, lat2, lon2)
+phi1 = deg2rad(lat1);
+phi2 = deg2rad(lat2);
+deltaPhi = deg2rad(lat2 - lat1);
+deltaLambda = deg2rad(lon2 - lon1);
+r = 6371;
+a = sin(deltaPhi/2)^2 + cos(phi1)*cos(phi2)*sin(deltaLambda/2)^2;
+c = 2 * atan2(sqrt(a), sqrt(1 - a));
+d = r * c;
+end
