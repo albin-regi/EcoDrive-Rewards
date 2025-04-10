@@ -10,7 +10,7 @@ pause(2);  % Pause briefly to allow the GUI to open
 
 %% Option 2: Backend Function Demo
 disp('Running backend demo with sample inputs...');
-
+newf=var(h-1)%10
 % Define sample input parameters
 start_coords = [9.981, 76.299];  % e.g. Mumbai (latitude, longitude)
 end_coords   = [10.527, 76.214];   % e.g. Navi Mumbai (latitude, longitude)
